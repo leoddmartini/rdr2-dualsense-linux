@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""DSX-compatible UDP bridge that drives a DualSense directly through hidraw.
+
+Red Dead Redemption 2 mods such as NodixDualSense.asi send DSX (DualSenseX)
+JSON instructions over UDP. DSX is a Windows-only application; this bridge
+listens on the same port, translates those instructions into DualSense output
+reports and writes them straight to the controller's /dev/hidraw node.
+
+Because it talks to hidraw from the Linux host, it keeps working while Steam
+Input owns the controller inside Proton.
+
+Design notes:
+  * Only the trigger-effect and lightbar flags are set in the output report,
+    so rumble sent by Steam Input is left untouched.
+  * A report is written only when the requested state changes, to avoid
+    overriding Steam's own output reports.
+  * Standard library only.
+
+Never use game mods in Red Dead Online.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import signal
+import socket
+import sys
+import time
+
+__version__ = "1.0.0"
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 6969
+
+# Raw DualSense trigger-effect mode bytes.
+# Values and the DSX conversion table below are ported from DualSenseY-v2
+# (https://github.com/WujekFoliarz/DualSenseY-v2, MIT License).
+OFF, RIGID, PULSE = 0x00, 0x01, 0x02
+RIGID_A, RIGID_B, RIGID_AB = 0x21, 0x05, 0x25
+PULSE_A, PULSE_A2, PULSE_B, PULSE_B2, PULSE_AB = 0x22, 0x23, 0x06, 0x26, 0x27
+FEEDBACK = 0x21
+
+CUSTOM_MODES = [
+    OFF, RIGID, RIGID_A, RIGID_B, RIGID_AB, PULSE, PULSE_A, PULSE_B, PULSE_AB,
+    PULSE_B, PULSE_B2, PULSE_B, PULSE_B2, PULSE_AB, PULSE_AB, PULSE_AB, PULSE_AB,
+]
+
+# DSX TriggerMode values that map to a fixed effect.
+FIXED_EFFECTS = {
+    0: [RIGID_B],                                    # Normal
+    1: [PULSE, 144, 160, 255],                       # GameCube
+    2: [PULSE, 128, 160, 255],                       # VerySoft
+    3: [RIGID_A, 69, 160, 255],                      # Soft
+    4: [RIGID_A, 32, 160, 255, 255, 255, 255, 255],  # Hard
+    5: [RIGID_A, 16, 160, 255, 255, 255, 255, 255],  # VeryHard
+    6: [PULSE, 0, 255, 255, 255, 255, 255, 255],     # Hardest
+    7: [RIGID, 0, 255],                              # Rigid
+    8: [PULSE_AB, 37, 35, 6, 39, 33, 35, 34],        # VibrateTrigger
+    9: [RIGID_A, 2, 39, 33, 39, 38, 2],              # Choppy
+    10: [PULSE_A, 2, 35, 1, 6, 6, 1, 33],            # Medium
+    11: [PULSE_AB, 37, 35, 6, 39, 33, 35, 34],       # VibrateTriggerPulse
+    19: [PULSE_B, 10, 255, 40],                      # VIBRATE_TRIGGER_10Hz
+    20: [OFF],                                       # OFF
+}
+
+EFFECT_LEN = 11          # mode byte + 10 parameter bytes
+USB_REPORT_ID = 0x02
+USB_REPORT_LEN = 48
+FLAG_RIGHT_TRIGGER = 0x04
+FLAG_LEFT_TRIGGER = 0x08
+FLAG_LIGHTBAR = 0x04
+TRIGGER_LEFT, TRIGGER_RIGHT = 1, 2
+INSTR_TRIGGER_UPDATE, INSTR_RGB_UPDATE = 1, 2
+
+EFFECT_OFF = [OFF] + [0] * (EFFECT_LEN - 1)
+
+verbose = False
+
+
+def log(msg: str) -> None:
+    print(time.strftime("[%H:%M:%S] ") + msg, flush=True)
+
+
+def clamp_byte(value) -> int:
+    return max(0, min(255, int(value)))
+
+
+def find_dualsense_usb() -> str | None:
+    """Return the hidraw device node of the first USB-connected DualSense."""
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(os.path.join(node, "device/uevent")) as f:
+                uevent = f.read()
+        except OSError:
+            continue
+        # HID_ID bus 0005 is Bluetooth, whose output report layout differs.
+        if "DualSense" in uevent and "HID_ID=0005:" not in uevent:
+            return "/dev/" + os.path.basename(node)
+    return None
+
+
+def _zones(start: int, level: int) -> list[int]:
+    """Encode a per-zone level from `start` to the end of the trigger travel."""
+    strengths = active = 0
+    for zone in range(start, 10):
+        strengths |= (level & 7) << (3 * zone)
+        active |= 1 << zone
+    return [active & 0xFF, (active >> 8) & 0xFF, strengths & 0xFF,
+            (strengths >> 8) & 0xFF, (strengths >> 16) & 0xFF, (strengths >> 24) & 0xFF]
+
+
+def dsx_trigger_effect(mode: int, params: list) -> list[int] | None:
+    """Convert a DSX TriggerMode and its parameters into an 11-byte effect.
+
+    Returns None when the mode is unknown or the parameters are out of range.
+    """
+    p = [int(x) for x in params]
+
+    def arg(i: int) -> int:
+        return p[i] if len(p) > i else 0
+
+    effect = None
+    if mode in FIXED_EFFECTS:
+        effect = FIXED_EFFECTS[mode]
+    elif mode == 12 and p:                               # CustomTriggerValue
+        custom = p[0]
+        raw = CUSTOM_MODES[custom] if 0 <= custom < len(CUSTOM_MODES) else OFF
+        effect = [raw] + [arg(i) for i in range(1, 8)] + [0, 0, arg(8)]
+    elif mode in (13, 21) and len(p) >= 2:               # Resistance / FEEDBACK
+        start, force = p[0], p[1]
+        if start <= 9 and 0 < force <= 8:
+            effect = [FEEDBACK] + _zones(start, force - 1)
+    elif mode == 14 and len(p) >= 4:                     # Bow
+        start, end, force, snap = p[:4]
+        if start < end <= 8 and 0 < force <= 8 and 0 < snap <= 8:
+            positions = (1 << start) | (1 << end)
+            forces = ((force - 1) & 7) | (((snap - 1) & 7) << 3)
+            effect = [PULSE_A, positions & 0xFF, positions >> 8, forces & 0xFF, forces >> 8]
+    elif mode == 15 and len(p) >= 5:                     # Galloping
+        start, end, first_foot, second_foot, freq = p[:5]
+        if start <= 8 and start < end <= 9 and first_foot < second_foot <= 7 and freq > 0:
+            positions = (1 << start) | (1 << end)
+            feet = (second_foot & 7) | ((first_foot & 7) << 3)
+            effect = [PULSE_A2, positions & 0xFF, positions >> 8, feet, freq]
+    elif mode in (16, 22) and len(p) >= 3:               # SemiAutomaticGun / WEAPON
+        start, end, force = p[:3]
+        if 2 <= start <= 7 and start < end <= 8 and 0 < force <= 8:
+            positions = (1 << start) | (1 << end)
+            effect = [RIGID_AB, positions & 0xFF, positions >> 8, force - 1]
+    elif mode in (17, 23) and len(p) >= 3:               # AutomaticGun / VIBRATION
+        start, strength, freq = p[:3]
+        if start <= 9 and 0 < strength <= 8 and freq > 0:
+            effect = [PULSE_B2] + _zones(start, strength - 1) + [0, 0, freq]
+    elif mode == 18 and len(p) >= 6:                     # Machine
+        start, end, amp_a, amp_b, freq, period = p[:6]
+        if start < end <= 9 and amp_a <= 7 and amp_b <= 7 and freq > 0:
+            positions = (1 << start) | (1 << end)
+            amps = (amp_a & 7) | ((amp_b & 7) << 3)
+            effect = [PULSE_AB, positions & 0xFF, positions >> 8, amps, freq, period]
+
+    if effect is None:
+        return None
+    return [clamp_byte(x) for x in (effect + [0] * EFFECT_LEN)[:EFFECT_LEN]]
+
+
+class ControllerState:
+    """Desired trigger effects and lightbar colour."""
+
+    def __init__(self) -> None:
+        self.left = list(EFFECT_OFF)
+        self.right = list(EFFECT_OFF)
+        self.rgb: tuple[int, int, int] | None = None
+
+    def reset_triggers(self) -> None:
+        self.left = list(EFFECT_OFF)
+        self.right = list(EFFECT_OFF)
+
+    def usb_report(self) -> bytes:
+        report = bytearray(USB_REPORT_LEN)
+        report[0] = USB_REPORT_ID
+        report[1] = FLAG_RIGHT_TRIGGER | FLAG_LEFT_TRIGGER
+        report[11:22] = bytes(self.right)
+        report[22:33] = bytes(self.left)
+        if self.rgb is not None:
+            report[2] = FLAG_LIGHTBAR
+            report[45:48] = bytes(self.rgb)
+        return bytes(report)
+
+    def apply(self, message: str) -> None:
+        """Apply one DSX JSON packet."""
+        try:
+            data = json.loads(message)
+        except ValueError:
+            log(f"ignoring malformed packet: {message[:200]!r}")
+            return
+        for instruction in data.get("instructions", []):
+            try:
+                self._apply_instruction(instruction)
+            except (TypeError, ValueError, IndexError) as exc:
+                log(f"ignoring invalid instruction {instruction!r}: {exc}")
+
+    def _apply_instruction(self, instruction: dict) -> None:
+        kind = instruction.get("type")
+        params = instruction.get("parameters", [])
+        if kind == INSTR_TRIGGER_UPDATE and len(params) >= 3:
+            # [controller, trigger (1=L2, 2=R2), mode, ...mode parameters]
+            effect = dsx_trigger_effect(int(params[2]), params[3:])
+            if effect is None:
+                log(f"unsupported trigger instruction: {params}")
+            elif int(params[1]) == TRIGGER_LEFT:
+                self.left = effect
+            elif int(params[1]) == TRIGGER_RIGHT:
+                self.right = effect
+        elif kind == INSTR_RGB_UPDATE and len(params) >= 4:
+            # [controller, r, g, b]
+            self.rgb = (clamp_byte(params[1]), clamp_byte(params[2]), clamp_byte(params[3]))
+        elif verbose:
+            log(f"ignored instruction: {instruction}")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--host", default=DEFAULT_HOST, help="address to listen on (default: %(default)s)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="UDP port (default: %(default)s)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="log every packet and state change")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    global verbose
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    verbose = args.verbose
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((args.host, args.port))
+    except OSError as exc:
+        log(f"cannot listen on UDP {args.host}:{args.port}: {exc}")
+        return 1
+    sock.settimeout(1.0)
+    log(f"DSX bridge listening on UDP {args.host}:{args.port}")
+
+    state = ControllerState()
+    fd: int | None = None
+    last_report: bytes | None = None
+    packets = 0
+    stop = False
+
+    def request_stop(*_):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
+    while not stop:
+        if fd is None:
+            device = find_dualsense_usb()
+            try:
+                fd = os.open(device, os.O_WRONLY) if device else None
+            except OSError as exc:
+                log(f"cannot open {device}: {exc}")
+            if fd is None:
+                log("DualSense (USB) not found, retrying in 5s")
+                time.sleep(5)
+                continue
+            log(f"DualSense opened at {device}")
+            last_report = None
+
+        try:
+            message, sender = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
+
+        packets += 1
+        if packets == 1:
+            log(f"first packet from {sender[0]}:{sender[1]}")
+        text = message.decode(errors="replace")
+        if verbose:
+            log(f"packet: {text[:300]}")
+        state.apply(text)
+
+        report = state.usb_report()
+        if report == last_report:
+            continue
+        try:
+            os.write(fd, report)
+            last_report = report
+            if verbose:
+                log(f"L2={state.left} R2={state.right} rgb={state.rgb}")
+        except OSError as exc:
+            log(f"write failed ({exc}), reconnecting")
+            os.close(fd)
+            fd = None
+
+    if fd is not None:
+        state.reset_triggers()
+        try:
+            os.write(fd, state.usb_report())
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    sock.close()
+    log(f"stopped after {packets} packets, triggers reset")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
