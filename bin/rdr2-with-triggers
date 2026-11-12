@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Steam launch wrapper for Red Dead Redemption 2.
+#
+# Starts the DualSense DSX bridge, runs the game, and stops the bridge when the
+# game exits. The game is NOT started if:
+#   - UDP port 6969 is held by another program (a stale copy of the bridge is
+#     restarted instead);
+#   - the bridge fails to start or cannot find a USB DualSense within the timeout.
+#
+# Steam launch options:
+#   WINEDLLOVERRIDES="dinput8=n,b" ~/.local/bin/rdr2-with-triggers %command%
+#
+# Environment overrides:
+#   RDR2_DSX_PORT     UDP port (default 6969)
+#   RDR2_DSX_TIMEOUT  seconds to wait for the controller (default 10)
+#   RDR2_DSX_LOG      log file (default ~/.local/state/rdr2-dualsense.log)
+set -u
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
+BRIDGE_BIN="${SCRIPT_DIR}/rdr2-dualsense-native"
+PORT="${RDR2_DSX_PORT:-6969}"
+TIMEOUT="${RDR2_DSX_TIMEOUT:-10}"
+LOG="${RDR2_DSX_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/rdr2-dualsense.log}"
+
+log() {
+    echo "[$(date +%T)] $*" >>"$LOG"
+}
+
+fail() {
+    echo "rdr2-with-triggers: $*" >&2
+    log "ABORT: $*"
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -u critical "Red Dead Redemption 2 was not started" "$*"
+    fi
+    exit 1
+}
+
+port_pids() {
+    ss -Hulpn "sport = :${PORT}" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u
+}
+
+if [ "$#" -eq 0 ]; then
+    echo "usage: $(basename "$0") <game command...>   (use %command% in Steam)" >&2
+    exit 2
+fi
+
+mkdir -p "$(dirname "$LOG")"
+: >"$LOG"
+
+[ -x "$BRIDGE_BIN" ] || fail "bridge not found or not executable: $BRIDGE_BIN"
+command -v ss >/dev/null 2>&1 || fail "'ss' (iproute2) is required"
+
+# 1. Free the port: restart a stale bridge, refuse any other program.
+for pid in $(port_pids); do
+    cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null)"
+    if [[ "$cmd" == *"$(basename "$BRIDGE_BIN")"* ]]; then
+        log "stopping stale bridge (pid ${pid})"
+        kill -INT "$pid" 2>/dev/null
+        for _ in $(seq 1 20); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.25
+        done
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    else
+        fail "UDP port ${PORT} is in use by another program (pid ${pid}: ${cmd:-unknown})"
+    fi
+done
+[ -z "$(port_pids)" ] || fail "UDP port ${PORT} is still in use"
+
+# 2. Start the bridge and wait until it listens and has opened the controller.
+python3 -u "$BRIDGE_BIN" --port "$PORT" >>"$LOG" 2>&1 &
+BRIDGE_PID=$!
+
+ready=0
+for _ in $(seq 1 $((TIMEOUT * 4))); do
+    kill -0 "$BRIDGE_PID" 2>/dev/null || fail "bridge exited during startup (see ${LOG})"
+    if grep -q "listening on UDP" "$LOG" && grep -q "DualSense opened" "$LOG"; then
+        ready=1
+        break
+    fi
+    sleep 0.25
+done
+
+if [ "$ready" -ne 1 ]; then
+    kill -INT "$BRIDGE_PID" 2>/dev/null
+    wait "$BRIDGE_PID" 2>/dev/null
+    fail "USB DualSense not found within ${TIMEOUT}s; connect the controller with a cable"
+fi
+
+# 3. Run the game, then stop the bridge.
+"$@"
+status=$?
+kill -INT "$BRIDGE_PID" 2>/dev/null
+wait "$BRIDGE_PID" 2>/dev/null
+exit "$status"
